@@ -218,6 +218,16 @@ BellShell is designed for use in restricted environments where users should only
 
 BellShell is intended as a hardened, restricted interface in labs, training environments, and controlled systems—not as a standalone, complete security solution.
 
+## 🖥️ Demo Screenshots
+
+### Startup & Security Enforcement
+![Startup](https://raw.githubusercontent.com/ReginaldBell/bellshell/main/demo_startup.png)
+
+### Allowed Commands
+![Allowed](https://raw.githubusercontent.com/ReginaldBell/bellshell/main/demo_allowed.png)
+
+### Blocked Commands
+![Blocked](https://raw.githubusercontent.com/ReginaldBell/bellshell/main/demo_blocked.png)
 
 ## Future Enhancements
 
@@ -242,4 +252,5 @@ Reginald Bell
 - POSIX.1-2008 Standard
 - C99 Standard (ISO/IEC 9899:1999)
 - Linux man pages: ftw(3), realpath(3), syslog(3)
+
 
