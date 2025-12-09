@@ -58,9 +58,31 @@ typedef struct {
 
 static rate_limit_state_t g_rate_limit = {0};
 
+/* Forward declarations */
+static void trim_newline(char *s);
+static void trim_whitespace(char *s);
+static int parse_line_secure(char *line, char **argv);
+static bool is_safe_argument(const char *arg);
+static bool sanitize_path(const char *path, char *sanitized, size_t size);
+static bool is_safe_scan_path(const char *path);
+static int drop_privileges_permanently(void);
+static bool is_command_allowed(const char *cmd);
+static void audit_log_secure(int priority, const char *level, const char *message);
+static int init_secure_logging(void);
+static void close_secure_logging(void);
+static void setup_signal_handlers(void);
+
+/* Built-in command forward declarations */
+static cmd_result_t builtin_exit(int argc, char **argv);
+static cmd_result_t builtin_cd(int argc, char **argv);
+static cmd_result_t builtin_help(int argc, char **argv);
+static cmd_result_t builtin_allowed(int argc, char **argv);
+static cmd_result_t builtin_suidscan(int argc, char **argv);
+static cmd_result_t builtin_suidscan_impl(int argc, char **argv);
+
 static bool check_rate_limit(void) {
     time_t now = time(NULL);
-    
+
     /* Reset counter every minute */
     if (now - g_rate_limit.window_start >= 60) {
         g_rate_limit.window_start = now;
@@ -68,30 +90,30 @@ static bool check_rate_limit(void) {
         g_rate_limit.failed_commands = 0;
         g_rate_limit.suspicious_commands = 0;
     }
-    
+
     g_rate_limit.command_count++;
-    
+
     /* Check for rate limit violation */
     if (g_rate_limit.command_count > MAX_COMMANDS_PER_MINUTE) {
         fprintf(stderr, "Rate limit exceeded (%d commands/min). Please slow down.\n",
                 MAX_COMMANDS_PER_MINUTE);
-        syslog(LOG_WARNING, "Rate limit exceeded by uid=%d - possible automation", 
+        syslog(LOG_WARNING, "Rate limit exceeded by uid=%d - possible automation",
                getuid());
         sleep(1); /* Throttle attacker */
         return false;
     }
-    
+
     /* Check for suspicious patterns */
     if (g_rate_limit.failed_commands > MAX_FAILED_COMMANDS) {
-        syslog(LOG_ALERT, "Multiple failed commands (uid=%d) - possible probing", 
+        syslog(LOG_ALERT, "Multiple failed commands (uid=%d) - possible probing",
                getuid());
     }
-    
+
     if (g_rate_limit.suspicious_commands > SUSPICIOUS_COMMAND_THRESHOLD) {
         fprintf(stderr, "WARNING: Suspicious activity detected. All actions are logged.\n");
         syslog(LOG_CRIT, "Anomalous command pattern detected (uid=%d)", getuid());
     }
-    
+
     return true;
 }
 
@@ -99,298 +121,24 @@ static void record_command_result(cmd_result_t result, const char *cmd) {
     if (result != CMD_SUCCESS) {
         g_rate_limit.failed_commands++;
     }
-    
+
     /* Detect suspicious commands */
     const char *suspicious_patterns[] = {
         "passwd", "shadow", "sudoers", "sudo", "su",
         "chmod", "chown", "setuid", "setgid",
         "nc", "netcat", "telnet", "nmap",
-        "/etc/passwd", "/etc/shadow", 
+        "/etc/passwd", "/etc/shadow",
         "rm -rf", "dd if=", "mkfs",
         NULL
     };
-    
+
     for (int i = 0; suspicious_patterns[i] != NULL; i++) {
         if (strstr(cmd, suspicious_patterns[i]) != NULL) {
             g_rate_limit.suspicious_commands++;
-            
+
             char audit_msg[512];
             snprintf(audit_msg, sizeof(audit_msg),
-             "SUID scan completed: %d SUID, %d SGID binaries found",
-             g_scan_ctx.count_suid, g_scan_ctx.count_sgid);
-    audit_log_secure(LOG_INFO, "INFO", audit_msg);
-
-    return CMD_SUCCESS;
-}
-
-/* Privilege-separated SUID scanner */
-static cmd_result_t builtin_suidscan(int argc, char **argv) {
-    /* Rate limit SUID scans to prevent abuse */
-    time_t now = time(NULL);
-    if (now - g_rate_limit.last_suidscan < 300) { /* 5 minutes */
-        time_t wait_time = 300 - (now - g_rate_limit.last_suidscan);
-        fprintf(stderr, "suidscan: Rate limited. Wait %ld seconds before next scan.\n",
-                (long)wait_time);
-        return CMD_ERROR;
-    }
-    
-    /* Require explicit confirmation */
-    printf("WARNING: SUID scanning is a security-sensitive operation.\n");
-    printf("This scan will be logged. Continue? (yes/no): ");
-    fflush(stdout);
-    
-    char response[16];
-    if (!fgets(response, sizeof(response), stdin)) {
-        return CMD_ERROR;
-    }
-    
-    trim_newline(response);
-    trim_whitespace(response);
-    
-    if (strcmp(response, "yes") != 0) {
-        printf("Scan cancelled.\n");
-        return CMD_SUCCESS;
-    }
-    
-    g_rate_limit.last_suidscan = now;
-    
-    /* Fork and drop privileges */
-    pid_t pid = fork();
-    if (pid < 0) {
-        perror("fork");
-        return CMD_ERROR;
-    }
-    
-    if (pid == 0) {
-        /* Child: drop privileges and scan */
-        if (drop_privileges_permanently() != 0) {
-            fprintf(stderr, "Failed to drop privileges\n");
-            exit(EXIT_FAILURE);
-        }
-        
-        exit(builtin_suidscan_impl(argc, argv));
-    }
-    
-    /* Parent: wait for scan */
-    int status;
-    waitpid(pid, &status, 0);
-    
-    return WIFEXITED(status) && WEXITSTATUS(status) == 0 
-           ? CMD_SUCCESS : CMD_ERROR;
-}
-
-/* ======================= BUILTIN DISPATCH ======================= */
-
-static int handle_builtin(int argc, char **argv) {
-    if (argc == 0) {
-        return CMD_SUCCESS;
-    }
-
-    struct builtin_entry {
-        const char    *name;
-        cmd_result_t (*handler)(int, char **);
-    };
-
-    static const struct builtin_entry builtins[] = {
-        { "exit",     builtin_exit     },
-        { "cd",       builtin_cd       },
-        { "help",     builtin_help     },
-        { "suidscan", builtin_suidscan },
-        { "allowed",  builtin_allowed  },
-        { NULL,       NULL             }
-    };
-
-    for (int i = 0; builtins[i].name != NULL; i++) {
-        if (strcmp(argv[0], builtins[i].name) == 0) {
-            return builtins[i].handler(argc, argv);
-        }
-    }
-
-    return -1;
-}
-
-/* ======================= EXTERNAL COMMAND EXECUTION ======================= */
-
-static cmd_result_t execute_external_secure(int argc, char **argv) {
-    (void)argc;
-    
-    /* Validate command is in whitelist */
-    if (!is_command_allowed(argv[0])) {
-        fprintf(stderr, "Command not allowed: %s\n", argv[0]);
-        fprintf(stderr, "Type 'allowed' to see whitelisted commands.\n");
-        
-        char audit_msg[512];
-        snprintf(audit_msg, sizeof(audit_msg), 
-                 "Blocked unauthorized command: %s", argv[0]);
-        audit_log_secure(LOG_WARNING, "SECURITY", audit_msg);
-        
-        return CMD_ERROR;
-    }
-
-    /* Log command execution */
-    char cmd_str[512] = {0};
-    size_t offset = 0;
-    for (int i = 0; argv[i] && offset < sizeof(cmd_str) - 1; i++) {
-        int written = snprintf(cmd_str + offset, sizeof(cmd_str) - offset,
-                              "%s%s", i > 0 ? " " : "", argv[i]);
-        if (written > 0) offset += (size_t)written;
-    }
-    
-    char audit_msg[512];
-    snprintf(audit_msg, sizeof(audit_msg), "Executing: %s", cmd_str);
-    audit_log_secure(LOG_INFO, "INFO", audit_msg);
-
-    pid_t pid = fork();
-    if (pid < 0) {
-        fprintf(stderr, "fork: %s\n", strerror(errno));
-        return CMD_ERROR;
-    }
-
-    if (pid == 0) {
-        /* Child process */
-        execvp(argv[0], argv);
-        fprintf(stderr, "%s: %s\n", argv[0], strerror(errno));
-        exit(EXIT_FAILURE);
-    }
-
-    /* Parent: wait for command */
-    int status;
-    pid_t r;
-    do {
-        r = waitpid(pid, &status, 0);
-    } while (r == -1 && errno == EINTR);
-
-    if (r == -1) {
-        fprintf(stderr, "waitpid: %s\n", strerror(errno));
-        return CMD_ERROR;
-    }
-
-    cmd_result_t result;
-    if (WIFEXITED(status)) {
-        result = (WEXITSTATUS(status) == 0) ? CMD_SUCCESS : CMD_ERROR;
-    } else if (WIFSIGNALED(status)) {
-        fprintf(stderr, "Command terminated by signal %d\n", WTERMSIG(status));
-        result = CMD_ERROR;
-    } else {
-        result = CMD_ERROR;
-    }
-    
-    return result;
-}
-
-/* ======================= PROMPT & MAIN LOOP ======================= */
-
-static void display_prompt(void) {
-    char cwd[PATH_MAX];
-
-    if (!getcwd(cwd, sizeof(cwd))) {
-        fprintf(stderr, "getcwd: %s\n", strerror(errno));
-        printf("%s> ", SHELL_NAME);
-    } else {
-        char *base = strrchr(cwd, '/');
-        if (base && base[1] != '\0') {
-            printf("%s:%s> ", SHELL_NAME, base + 1);
-        } else {
-            printf("%s:%s> ", SHELL_NAME, cwd);
-        }
-    }
-    fflush(stdout);
-}
-
-int main(void) {
-    char line[MAX_LINE];
-    char *argv[MAX_ARGS];
-
-    /* Initialize security subsystems */
-    init_secure_logging();
-    setup_signal_handlers();
-    
-    audit_log_secure(LOG_INFO, "INFO", "Shell started");
-
-    printf("\n");
-    printf("╔══════════════════════════════════════════════════════════╗\n");
-    printf("║  %s v%s - Hardened Shell                    ║\n", SHELL_NAME, VERSION);
-    printf("╚══════════════════════════════════════════════════════════╝\n");
-    printf("\n");
-    printf("Security Features:\n");
-    printf("  ✓ Audit logging enabled (syslog + file)\n");
-    printf("  ✓ Command whitelisting active\n");
-    printf("  ✓ Input sanitization enabled\n");
-    printf("  ✓ Rate limiting: %d commands/min\n", MAX_COMMANDS_PER_MINUTE);
-    printf("  ✓ Anomaly detection active\n");
-    printf("\n");
-    printf("Type 'help' for available commands.\n");
-    printf("Type 'allowed' to see whitelisted external commands.\n\n");
-
-    while (!g_shutdown_requested) {
-        display_prompt();
-
-        /* Check rate limit before accepting input */
-        if (!check_rate_limit()) {
-            continue;
-        }
-
-        if (!fgets(line, sizeof(line), stdin)) {
-            if (feof(stdin)) {
-                printf("\n");
-                break;
-            } else if (errno == EINTR) {
-                clearerr(stdin);
-                continue;
-            } else {
-                fprintf(stderr, "fgets: %s\n", strerror(errno));
-                break;
-            }
-        }
-
-        size_t len = strlen(line);
-        if (len > 0 && line[len - 1] != '\n' && !feof(stdin)) {
-            fprintf(stderr, "Error: input line too long (max %d chars)\n",
-                    MAX_LINE - 1);
-            
-            audit_log_secure(LOG_WARNING, "SECURITY", 
-                           "Oversized input detected - possible buffer overflow attempt");
-            
-            int c;
-            while ((c = getchar()) != '\n' && c != EOF)
-                ;
-            continue;
-        }
-
-        trim_newline(line);
-        trim_whitespace(line);
-
-        if (line[0] == '\0')
-            continue;
-
-        int argc = parse_line_secure(line, argv);
-        if (argc == 0) {
-            /* parse_line_secure already logged the issue */
-            record_command_result(CMD_ERROR, line);
-            continue;
-        }
-
-        /* Handle built-in commands */
-        int builtin_result = handle_builtin(argc, argv);
-        if (builtin_result >= 0) {
-            if (builtin_result == CMD_EXIT) {
-                break;
-            }
-            record_command_result(builtin_result, argv[0]);
-            continue;
-        }
-
-        /* Execute external command */
-        cmd_result_t result = execute_external_secure(argc, argv);
-        record_command_result(result, argv[0]);
-    }
-
-    audit_log_secure(LOG_INFO, "INFO", "Shell shutting down");
-    close_secure_logging();
-
-    printf("\nGoodbye!\n");
-    return 0;
-}        "Suspicious command pattern: %s", cmd);
+                     "Suspicious command pattern: %s", cmd);
             syslog(LOG_NOTICE, "[SECURITY] %s (uid=%d)", audit_msg, getuid());
             break;
         }
@@ -402,41 +150,41 @@ int main(void) {
 static int init_secure_logging(void) {
     /* Open connection to system logger */
     openlog(SHELL_NAME, LOG_PID | LOG_CONS, LOG_AUTHPRIV);
-    
+
     /* Create secure log directory */
     const char *log_dir = "/var/log/bellshell";
     const char *log_path = "/var/log/bellshell/audit.log";
-    
+
     /* Try to create directory with restricted permissions */
     if (mkdir(log_dir, S_IRWXU) != 0 && errno != EEXIST) {
         /* Fall back to user's home if /var/log is not writable */
         const char *home = getenv("HOME");
         if (home) {
             static char fallback_path[PATH_MAX];
-            snprintf(fallback_path, sizeof(fallback_path), 
+            snprintf(fallback_path, sizeof(fallback_path),
                      "%s/.bellshell/audit.log", home);
-            
+
             char fallback_dir[PATH_MAX];
             snprintf(fallback_dir, sizeof(fallback_dir), "%s/.bellshell", home);
             mkdir(fallback_dir, S_IRWXU);
-            
+
             log_path = fallback_path;
         } else {
             log_path = "/tmp/bellshell_audit.log";
         }
     }
-    
+
     /* Open with restricted permissions and safety flags */
     g_audit_fd = open(log_path,
                       O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC | O_NOFOLLOW,
                       S_IRUSR | S_IWUSR);
-    
+
     if (g_audit_fd == -1) {
-        syslog(LOG_ERR, "Failed to open audit log at %s: %s", 
+        syslog(LOG_ERR, "Failed to open audit log at %s: %s",
                log_path, strerror(errno));
         return -1;
     }
-    
+
     /* Verify file ownership to prevent symlink attacks */
     struct stat st;
     if (fstat(g_audit_fd, &st) == 0) {
@@ -447,7 +195,7 @@ static int init_secure_logging(void) {
             return -1;
         }
     }
-    
+
     syslog(LOG_INFO, "Audit logging initialized at %s", log_path);
     return 0;
 }
@@ -455,25 +203,25 @@ static int init_secure_logging(void) {
 static void audit_log_secure(int priority, const char *level, const char *message) {
     /* Always log to syslog for tamper-proof logging */
     syslog(priority, "[%s] %s", level, message);
-    
+
     /* Also log to file if available */
     if (g_audit_fd == -1) return;
-    
+
     char timestamp[64];
     time_t now = time(NULL);
     struct tm *tm_info = localtime(&now);
-    
+
     if (tm_info) {
         strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", tm_info);
     } else {
         snprintf(timestamp, sizeof(timestamp), "UNKNOWN");
     }
-    
+
     char log_entry[1024];
     int len = snprintf(log_entry, sizeof(log_entry),
-                       "[%s] [PID:%d] [UID:%d] [%s] %s\n", 
+                       "[%s] [PID:%d] [UID:%d] [%s] %s\n",
                        timestamp, getpid(), getuid(), level, message);
-    
+
     if (len > 0 && len < (int)sizeof(log_entry)) {
         ssize_t written = write(g_audit_fd, log_entry, (size_t)len);
         if (written == -1) {
@@ -496,7 +244,7 @@ static void sigint_handler(int signo) {
     (void)signo;
     const char msg[] = "\n";
     write(STDOUT_FILENO, msg, sizeof(msg) - 1);
-    g_shutdown_requested = 0;
+    g_shutdown_requested = 1;
 }
 
 static void sigchld_handler(int signo) {
@@ -560,41 +308,41 @@ static void trim_whitespace(char *s) {
 /* Validate that argument doesn't contain shell metacharacters */
 static bool is_safe_argument(const char *arg) {
     if (!arg) return false;
-    
+
     /* Reject dangerous shell metacharacters */
     const char *dangerous = "|&;<>()$`\\\"'*?[]!{}~";
-    
+
     for (const char *p = arg; *p; p++) {
         if (strchr(dangerous, *p) != NULL) {
             return false;
         }
     }
-    
+
     /* Reject null bytes */
     if (strlen(arg) != (size_t)(strchr(arg, '\0') - arg)) {
         return false;
     }
-    
+
     return true;
 }
 
 /* Sanitize path to prevent directory traversal */
 static bool sanitize_path(const char *path, char *sanitized, size_t size) {
     if (!path || !sanitized || size == 0) return false;
-    
+
     /* Resolve to absolute path */
     char resolved[PATH_MAX];
     if (!realpath(path, resolved)) {
         /* If path doesn't exist, check parent directory */
         char parent[PATH_MAX];
         char *last_slash = strrchr(path, '/');
-        
+
         if (last_slash) {
             size_t parent_len = (size_t)(last_slash - path);
             if (parent_len == 0) parent_len = 1; /* root */
             strncpy(parent, path, parent_len);
             parent[parent_len] = '\0';
-            
+
             if (!realpath(parent, resolved)) {
                 return false;
             }
@@ -604,12 +352,12 @@ static bool sanitize_path(const char *path, char *sanitized, size_t size) {
             }
         }
     }
-    
+
     /* Check for directory traversal attempts */
     if (strstr(resolved, "..") != NULL) {
         return false;
     }
-    
+
     strncpy(sanitized, resolved, size - 1);
     sanitized[size - 1] = '\0';
     return true;
@@ -652,18 +400,18 @@ static int parse_line_secure(char *line, char **argv) {
     }
 
     argv[argc] = NULL;
-    
+
     /* Validate each argument */
     for (int i = 0; i < argc; i++) {
         if (!is_safe_argument(argv[i])) {
-            fprintf(stderr, "Security: Dangerous characters detected in argument: %s\n", 
+            fprintf(stderr, "Security: Dangerous characters detected in argument: %s\n",
                     argv[i]);
-            audit_log_secure(LOG_WARNING, "SECURITY", 
+            audit_log_secure(LOG_WARNING, "SECURITY",
                            "Command injection attempt blocked");
             return 0;
         }
     }
-    
+
     return argc;
 }
 
@@ -705,32 +453,32 @@ static bool is_safe_scan_path(const char *path) {
 static int drop_privileges_permanently(void) {
     uid_t real_uid = getuid();
     gid_t real_gid = getgid();
-    
+
     /* Drop supplementary groups */
     if (setgroups(0, NULL) != 0) {
         perror("setgroups");
         return -1;
     }
-    
+
     /* Drop to real GID */
     if (setgid(real_gid) != 0) {
         perror("setgid");
         return -1;
     }
-    
+
     /* Drop to real UID (irreversible) */
     if (setuid(real_uid) != 0) {
         perror("setuid");
         return -1;
     }
-    
+
     /* Verify we can't regain privileges */
     if (setuid(0) == 0) {
         fprintf(stderr, "SECURITY ERROR: Failed to drop privileges permanently\n");
         syslog(LOG_CRIT, "Privilege drop validation failed - possible security breach");
         return -1;
     }
-    
+
     return 0;
 }
 
@@ -748,7 +496,7 @@ static const char *allowed_commands[] = {
 
 static bool is_command_allowed(const char *cmd) {
     if (!cmd) return false;
-    
+
     /* Extract basename if full path provided */
     const char *basename = strrchr(cmd, '/');
     if (basename) {
@@ -756,14 +504,14 @@ static bool is_command_allowed(const char *cmd) {
     } else {
         basename = cmd;
     }
-    
+
     /* Check if command is in allowlist */
     for (int i = 0; allowed_commands[i] != NULL; i++) {
         if (strcmp(basename, allowed_commands[i]) == 0) {
             return true;
         }
     }
-    
+
     return false;
 }
 
@@ -801,7 +549,7 @@ static cmd_result_t builtin_cd(int argc, char **argv) {
     } else {
         target = argv[1];
     }
-    
+
     /* Sanitize path */
     char safe_path[PATH_MAX];
     if (!sanitize_path(target, safe_path, sizeof(safe_path))) {
@@ -822,8 +570,8 @@ static cmd_result_t builtin_help(int argc, char **argv) {
     (void)argv;
 
     printf("\n%s version %s - Hardened Shell\n", SHELL_NAME, VERSION);
-    printf("=".repeat(50) + "\n\n");
-    
+    printf("%.*s\n\n", 50, "==================================================");
+
     printf("=== Built-in Commands ===\n");
     printf("  cd [dir]           - Change directory\n");
     printf("  exit [code]        - Exit shell\n");
@@ -833,7 +581,7 @@ static cmd_result_t builtin_help(int argc, char **argv) {
     printf("      -s             - Include SGID binaries in results\n");
     printf("      -v             - Verbose output with permissions\n");
     printf("  allowed            - List whitelisted external commands\n");
-    
+
     printf("\n=== Security Features ===\n");
     printf("  ✓ Audit logging (syslog + file)\n");
     printf("  ✓ Command whitelisting (only safe commands allowed)\n");
@@ -842,13 +590,13 @@ static cmd_result_t builtin_help(int argc, char **argv) {
     printf("  ✓ Anomaly detection (suspicious pattern recognition)\n");
     printf("  ✓ Path validation (directory traversal prevention)\n");
     printf("  ✓ Privilege separation (SUID scans run unprivileged)\n");
-    
+
     printf("\n=== Usage Notes ===\n");
     printf("  - Only whitelisted external commands are allowed\n");
     printf("  - All commands are logged for audit purposes\n");
     printf("  - Suspicious activity triggers security alerts\n");
     printf("  - Type 'allowed' to see which external commands can run\n");
-    
+
     printf("\n");
     return CMD_SUCCESS;
 }
@@ -856,10 +604,10 @@ static cmd_result_t builtin_help(int argc, char **argv) {
 static cmd_result_t builtin_allowed(int argc, char **argv) {
     (void)argc;
     (void)argv;
-    
+
     printf("\n=== Whitelisted External Commands ===\n");
     printf("The following commands are allowed to execute:\n\n");
-    
+
     int count = 0;
     for (int i = 0; allowed_commands[i] != NULL; i++) {
         printf("  %-15s", allowed_commands[i]);
@@ -867,10 +615,10 @@ static cmd_result_t builtin_allowed(int argc, char **argv) {
         if (count % 4 == 0) printf("\n");
     }
     if (count % 4 != 0) printf("\n");
-    
+
     printf("\nTotal: %d commands\n", count);
     printf("\nTo request additional commands, contact your administrator.\n\n");
-    
+
     return CMD_SUCCESS;
 }
 
@@ -1086,4 +834,278 @@ static cmd_result_t builtin_suidscan_impl(int argc, char **argv) {
     printf("Time elapsed: %ld seconds\n", (long)elapsed);
 
     snprintf(audit_msg, sizeof(audit_msg),
-             "
+             "SUID scan completed: %d SUID, %d SGID binaries found",
+             g_scan_ctx.count_suid, g_scan_ctx.count_sgid);
+    audit_log_secure(LOG_INFO, "INFO", audit_msg);
+
+    return CMD_SUCCESS;
+}
+
+/* Privilege-separated SUID scanner */
+static cmd_result_t builtin_suidscan(int argc, char **argv) {
+    /* Rate limit SUID scans to prevent abuse */
+    time_t now = time(NULL);
+    if (now - g_rate_limit.last_suidscan < 300) { /* 5 minutes */
+        time_t wait_time = 300 - (now - g_rate_limit.last_suidscan);
+        fprintf(stderr, "suidscan: Rate limited. Wait %ld seconds before next scan.\n",
+                (long)wait_time);
+        return CMD_ERROR;
+    }
+
+    /* Require explicit confirmation */
+    printf("WARNING: SUID scanning is a security-sensitive operation.\n");
+    printf("This scan will be logged. Continue? (yes/no): ");
+    fflush(stdout);
+
+    char response[16];
+    if (!fgets(response, sizeof(response), stdin)) {
+        return CMD_ERROR;
+    }
+
+    trim_newline(response);
+    trim_whitespace(response);
+
+    if (strcmp(response, "yes") != 0) {
+        printf("Scan cancelled.\n");
+        return CMD_SUCCESS;
+    }
+
+    g_rate_limit.last_suidscan = now;
+
+    /* Fork and drop privileges */
+    pid_t pid = fork();
+    if (pid < 0) {
+        perror("fork");
+        return CMD_ERROR;
+    }
+
+    if (pid == 0) {
+        /* Child: drop privileges and scan */
+        if (drop_privileges_permanently() != 0) {
+            fprintf(stderr, "Failed to drop privileges\n");
+            exit(EXIT_FAILURE);
+        }
+
+        exit(builtin_suidscan_impl(argc, argv));
+    }
+
+    /* Parent: wait for scan */
+    int status;
+    waitpid(pid, &status, 0);
+
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0
+           ? CMD_SUCCESS : CMD_ERROR;
+}
+
+/* ======================= BUILTIN DISPATCH ======================= */
+
+static int handle_builtin(int argc, char **argv) {
+    if (argc == 0) {
+        return CMD_SUCCESS;
+    }
+
+    struct builtin_entry {
+        const char    *name;
+        cmd_result_t (*handler)(int, char **);
+    };
+
+    static const struct builtin_entry builtins[] = {
+        { "exit",     builtin_exit     },
+        { "cd",       builtin_cd       },
+        { "help",     builtin_help     },
+        { "suidscan", builtin_suidscan },
+        { "allowed",  builtin_allowed  },
+        { NULL,       NULL             }
+    };
+
+    for (int i = 0; builtins[i].name != NULL; i++) {
+        if (strcmp(argv[0], builtins[i].name) == 0) {
+            return builtins[i].handler(argc, argv);
+        }
+    }
+
+    return -1;
+}
+
+/* ======================= EXTERNAL COMMAND EXECUTION ======================= */
+
+static cmd_result_t execute_external_secure(int argc, char **argv) {
+    (void)argc;
+
+    /* Validate command is in whitelist */
+    if (!is_command_allowed(argv[0])) {
+        fprintf(stderr, "Command not allowed: %s\n", argv[0]);
+        fprintf(stderr, "Type 'allowed' to see whitelisted commands.\n");
+
+        char audit_msg[512];
+        snprintf(audit_msg, sizeof(audit_msg),
+                 "Blocked unauthorized command: %s", argv[0]);
+        audit_log_secure(LOG_WARNING, "SECURITY", audit_msg);
+
+        return CMD_ERROR;
+    }
+
+    /* Log command execution */
+    char cmd_str[512] = {0};
+    size_t offset = 0;
+    for (int i = 0; argv[i] && offset < sizeof(cmd_str) - 1; i++) {
+        int written = snprintf(cmd_str + offset, sizeof(cmd_str) - offset,
+                              "%s%s", i > 0 ? " " : "", argv[i]);
+        if (written > 0) offset += (size_t)written;
+    }
+
+    char audit_msg[512];
+    snprintf(audit_msg, sizeof(audit_msg), "Executing: %s", cmd_str);
+    audit_log_secure(LOG_INFO, "INFO", audit_msg);
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        fprintf(stderr, "fork: %s\n", strerror(errno));
+        return CMD_ERROR;
+    }
+
+    if (pid == 0) {
+        /* Child process */
+        execvp(argv[0], argv);
+        fprintf(stderr, "%s: %s\n", argv[0], strerror(errno));
+        exit(EXIT_FAILURE);
+    }
+
+    /* Parent: wait for command */
+    int status;
+    pid_t r;
+    do {
+        r = waitpid(pid, &status, 0);
+    } while (r == -1 && errno == EINTR);
+
+    if (r == -1) {
+        fprintf(stderr, "waitpid: %s\n", strerror(errno));
+        return CMD_ERROR;
+    }
+
+    cmd_result_t result;
+    if (WIFEXITED(status)) {
+        result = (WEXITSTATUS(status) == 0) ? CMD_SUCCESS : CMD_ERROR;
+    } else if (WIFSIGNALED(status)) {
+        fprintf(stderr, "Command terminated by signal %d\n", WTERMSIG(status));
+        result = CMD_ERROR;
+    } else {
+        result = CMD_ERROR;
+    }
+
+    return result;
+}
+
+/* ======================= PROMPT & MAIN LOOP ======================= */
+
+static void display_prompt(void) {
+    char cwd[PATH_MAX];
+
+    if (!getcwd(cwd, sizeof(cwd))) {
+        fprintf(stderr, "getcwd: %s\n", strerror(errno));
+        printf("%s> ", SHELL_NAME);
+    } else {
+        char *base = strrchr(cwd, '/');
+        if (base && base[1] != '\0') {
+            printf("%s:%s> ", SHELL_NAME, base + 1);
+        } else {
+            printf("%s:%s> ", SHELL_NAME, cwd);
+        }
+    }
+    fflush(stdout);
+}
+
+int main(void) {
+    char line[MAX_LINE];
+    char *argv[MAX_ARGS];
+
+    /* Initialize security subsystems */
+    init_secure_logging();
+    setup_signal_handlers();
+
+    audit_log_secure(LOG_INFO, "INFO", "Shell started");
+
+    printf("\n");
+    printf("╔══════════════════════════════════════════════════════════╗\n");
+    printf("║  %s v%s - Hardened Shell                    ║\n", SHELL_NAME, VERSION);
+    printf("╚══════════════════════════════════════════════════════════╝\n");
+    printf("\n");
+    printf("Security Features:\n");
+    printf("  ✓ Audit logging enabled (syslog + file)\n");
+    printf("  ✓ Command whitelisting active\n");
+    printf("  ✓ Input sanitization enabled\n");
+    printf("  ✓ Rate limiting: %d commands/min\n", MAX_COMMANDS_PER_MINUTE);
+    printf("  ✓ Anomaly detection active\n");
+    printf("\n");
+    printf("Type 'help' for available commands.\n");
+    printf("Type 'allowed' to see whitelisted external commands.\n\n");
+
+    while (!g_shutdown_requested) {
+        display_prompt();
+
+        /* Check rate limit before accepting input */
+        if (!check_rate_limit()) {
+            continue;
+        }
+
+        if (!fgets(line, sizeof(line), stdin)) {
+            if (feof(stdin)) {
+                printf("\n");
+                break;
+            } else if (errno == EINTR) {
+                clearerr(stdin);
+                continue;
+            } else {
+                fprintf(stderr, "fgets: %s\n", strerror(errno));
+                break;
+            }
+        }
+
+        size_t len = strlen(line);
+        if (len > 0 && line[len - 1] != '\n' && !feof(stdin)) {
+            fprintf(stderr, "Error: input line too long (max %d chars)\n",
+                    MAX_LINE - 1);
+
+            audit_log_secure(LOG_WARNING, "SECURITY",
+                           "Oversized input detected - possible buffer overflow attempt");
+
+            int c;
+            while ((c = getchar()) != '\n' && c != EOF)
+                ;
+            continue;
+        }
+
+        trim_newline(line);
+        trim_whitespace(line);
+
+        if (line[0] == '\0')
+            continue;
+
+        int argc = parse_line_secure(line, argv);
+        if (argc == 0) {
+            /* parse_line_secure already logged the issue */
+            record_command_result(CMD_ERROR, line);
+            continue;
+        }
+
+        /* Handle built-in commands */
+        int builtin_result = handle_builtin(argc, argv);
+        if (builtin_result >= 0) {
+            if (builtin_result == CMD_EXIT) {
+                break;
+            }
+            record_command_result(builtin_result, argv[0]);
+            continue;
+        }
+
+        /* Execute external command */
+        cmd_result_t result = execute_external_secure(argc, argv);
+        record_command_result(result, argv[0]);
+    }
+
+    audit_log_secure(LOG_INFO, "INFO", "Shell shutting down");
+    close_secure_logging();
+
+    printf("\nGoodbye!\n");
+    return 0;
+}
