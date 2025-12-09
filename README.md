@@ -201,6 +201,23 @@ CFLAGS := -Wall -Wextra -pedantic -std=c99 -pthread
 - `-std=c99`: C99 standard for modern C features
 - `-pthread`: POSIX threading support
 - `-I./include`: Include directory for headers
+-
+-  ## Threat Model & Limitations
+
+BellShell is designed for use in restricted environments where users should only be able to run a small, controlled set of commands. The primary security goals are:
+
+- **Reduce attack surface** by blocking execution of arbitrary binaries, subshells, and other dangerous commands.
+- **Limit privilege escalation paths** by detecting and restricting interaction with SUID/privileged binaries where possible.
+- **Improve auditability** by making user actions more predictable and easier to log or monitor.
+
+**Out of scope / limitations:**
+
+- BellShell does **not** replace a full OS hardening strategy (kernel hardening, mandatory access control, patch management, etc.).
+- It does **not** defend against kernel-level exploits, hardware attacks, or vulnerabilities in the underlying C runtime or system libraries.
+- Security guarantees depend on correct deployment (file permissions, user/group setup, and system configuration) and should be combined with other controls such as chroot/jails, containers, or VMs.
+
+BellShell is intended as a hardened, restricted interface in labs, training environments, and controlled systems—not as a standalone, complete security solution.
+
 
 ## Future Enhancements
 
@@ -213,15 +230,16 @@ CFLAGS := -Wall -Wextra -pedantic -std=c99 -pthread
 - [ ] Network-based rate limiting
 
 ## License
-
-[Your License Here]
+This project is licensed under the MIT License.  
+See the [LICENSE](LICENSE) file for more details.
 
 ## Author
 
-[Author Name]
+Reginald Bell
 
 ## References
 
 - POSIX.1-2008 Standard
 - C99 Standard (ISO/IEC 9899:1999)
 - Linux man pages: ftw(3), realpath(3), syslog(3)
+
